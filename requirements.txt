@@ -1,0 +1,8 @@
+fsspec==2023.6.0
+gcsfs==2023.6.0
+numpy==1.22.3
+pandas==1.5.2
+Pillow==10.0.1
+pyarrow==10.0.*
+requests==2.31.0
+shapely==2.0.1
