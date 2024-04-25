@@ -14,7 +14,7 @@ import pandas as pd
 import requests
 from PIL import ExifTags, Image, UnidentifiedImageError
 
-from COCOUtils import rbb_coco_from_seg
+from MLPipelines.COCOUtils import rbb_coco_from_seg
 
 
 class CvatApi:
