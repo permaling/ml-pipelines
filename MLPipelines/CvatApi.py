@@ -285,7 +285,7 @@ class CvatApi:
 
             try:
                 if respect_exif:
-                    image_bytes.append(load_image_to_bytes(img_fn))
+                    image_bytes.append(CvatApi.load_image_to_bytes(img_fn))
                 else:
                     image = Image.open(img_fn)
                     with io.BytesIO() as ib:

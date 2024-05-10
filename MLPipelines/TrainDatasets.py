@@ -13,6 +13,7 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.compute as pac
 import pyarrow.dataset as ds
+import pyarrow.feather as feather
 import pyarrow.fs as fs
 import pyarrow.parquet as pq
 from PIL import Image, ImageDraw
@@ -185,9 +186,15 @@ class DatasetObjDetect(object):
         if self.annotations is None:
             self.annotations = ds.dataset(self.anno_path, schema=self.anno_schema, filesystem=self.pa_fs, partitioning="hive")
 
-    def unique_image_names(self, project_ids: int, skip_tags: List = []) -> List[str]:
-        self.create_datasources()
-        image_df = self.images.to_table(columns=["image_name", "tags"], filter=(ds.field("project_id").isin(project_ids))).to_pandas()
+    def unique_image_names(self, project_ids: List[int], skip_tags: List[str] = [], image_feather: str = None) -> List[str]:
+        if image_feather is not None:
+            image_df = []
+            for project_id in project_ids:
+                image_df.append(feather.read_feather(image_feather.format(project_id)))
+            image_df = pd.concat(image_df)
+        else:
+            self.create_datasources()
+            image_df = self.images.to_table(columns=["image_name", "tags"], filter=(ds.field("project_id").isin(project_ids))).to_pandas()
         image_df = image_df[image_df['tags'].apply(lambda x: self.filter_skip_tags(skip_tags, x))]
         return image_df['image_name'].unique()
 
@@ -222,15 +229,24 @@ class DatasetObjDetect(object):
         })
         return df.drop_duplicates()
 
-    def image_sampler(self, project_ids: int, skip_tags: List = [], p: float = 0.2) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def image_sampler(self, project_ids: List[int], skip_tags: List[str] = [], image_feather: str = None, anno_feather: str = None, p: float = 0.2) -> Tuple[pd.DataFrame, pd.DataFrame]:
         train_df = []
         validate_df = []
-        image_names = self.unique_image_names(project_ids, skip_tags)
+        image_names = self.unique_image_names(project_ids, skip_tags, image_feather)
         print('Found', len(image_names), 'unique images')
         np.random.shuffle(image_names)
         val_images = image_names[:int(len(image_names)*p)]
+        anno_df = []
+        if anno_feather is not None:
+            anno_df = []
+            for project_id in project_ids:
+                anno_df.append(feather.read_feather(anno_feather.format(project_id)))
+            anno_dfs = pd.concat(anno_df)
         for image_name in image_names:
-            anno_df = self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name") == image_name).to_pandas()
+            if anno_feather is not None:
+                anno_df = anno_dfs[anno_dfs['image_name'] == image_name]
+            else:
+                anno_df = self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name") == image_name).to_pandas()
             if image_name in val_images:
                 print("Adding", image_name, "to val")
                 validate_df.append(anno_df)
@@ -242,6 +258,16 @@ class DatasetObjDetect(object):
         if validate_df:
             validate_df = pd.concat(validate_df)
         return train_df, validate_df
+
+    def get_annotations_by_project(self, project_id: int, skip_tags: List = []) -> pd.DataFrame:
+        self.create_datasources()
+        image_names = self.unique_image_names([project_id], skip_tags=skip_tags)
+        anno_df = []
+        for image_name in image_names:
+            anno_df.append(self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name") == image_name).to_pandas())
+        if anno_df:
+            anno_df = pd.concat(anno_df)
+        return anno_df
 
     @staticmethod
     def redact_segmentation(img, cats, segs):
@@ -260,42 +286,58 @@ class DatasetObjDetect(object):
         return img
 
     @staticmethod
-    def preprocess_image_with_labels(anno_df, row):
-        labels = anno_df[anno_df['image_name'] == row.image_name]
-        img = Image.open(io.BytesIO(row.image_bytes))
+    def preprocess_image_with_labels(img, anno_df, row):
         labels = anno_df[anno_df['image_name'] == row.image_name]
         labs = DatasetObjDetect.redact_segmentation(img, labels['category'].values, labels['segmentation'].values)
         return img
 
-    def write_images(self, anno_df: pd.DataFrame, img_dir: str) -> None:
+    def write_images(self, anno_df: pd.DataFrame, output_dir: str, image_feather: str = None, image_dir: str = None) -> None:
         image_names = []
         widths = []
         heights = []
-        if not os.path.exists(img_dir):
-            os.makedirs(img_dir)
+        tags = []
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
         count = 0
+        if image_feather is not None:
+            image_df = []
+            for project_id in anno_df['project_id'].unique():
+                image_df.append(feather.read_feather(image_feather.format(project_id)))
+            image_dfs = pd.concat(image_df)
+        else:
+            self.create_datasources()
         # Remove things labeled 'badimage'
         for image_name in anno_df['image_name'].unique():
             image_name = os.path.splitext(image_name)[0]
-            image_df = self.images.to_table(columns=image_proj, filter=ds.field("image_name") == image_name).to_pandas()
-            tags = [tag for taglist in list(image_df['tags']) for tag in taglist]
-            if 'badimage' in tags:
+            if image_feather is not None:
+                image_df = image_dfs[image_dfs['image_name'] == image_name]
+            else:
+                image_df = self.images.to_table(columns=image_proj, filter=ds.field("image_name") == image_name).to_pandas()
+            tag_list = [tag for taglist in list(image_df['tags']) for tag in taglist]
+            if 'badimage' in tag_list:
                 print('Skipping bad image', image_name)
                 continue
             for _, row in image_df.iterrows():
+                if image_dir is not None and os.path.exists(os.path.join(image_dir, f"{image_name}.jpeg")):
+                    img = Image.open(os.path.join(image_dir, f"{image_name}.jpeg"))
+                else:
+                    img = Image.open(io.BytesIO(row.image_bytes))
                 # This will redact excluded regions
-                img = self.preprocess_image_with_labels(anno_df, row)
-                img.save(os.path.join(img_dir, image_name+".jpeg"))
+                img = self.preprocess_image_with_labels(img, anno_df, row)
+                img.save(os.path.join(output_dir, f"{image_name}.jpeg"))
                 image_names.append(image_name)
                 widths.append(img.width)
                 heights.append(img.height)
+                tags.append(tag_list)
             if count % 10:
                 print(".", end="")
             count += 1
+        print()
         return pd.DataFrame({
             'image_name': image_names,
             'width': widths,
-            'height': heights
+            'height': heights,
+            'tags': tags
         })
 
 class DatasetN1Crops(object):
