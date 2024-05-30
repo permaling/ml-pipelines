@@ -196,6 +196,7 @@ class DatasetObjDetect(object):
             image_df = pd.concat(image_df)
         else:
             self.create_datasources()
+            print('Filtering unique images')
             image_df = self.images.to_table(columns=["image_name", "tags"], filter=(ds.field("project_id").isin(project_ids))).to_pandas()
         image_df = image_df[image_df['tags'].apply(lambda x: self.filter_skip_tags(skip_tags, x))]
         return image_df['image_name'].unique()
@@ -244,6 +245,7 @@ class DatasetObjDetect(object):
             anno_dfs = pd.concat(anno_df)
         else:
             self.create_datasources()
+            print('Filtering annotations')
             anno_dfs = self.annotations.to_table(columns=self.anno_proj, filter=(ds.field("project_id").isin(project_ids))).to_pandas()
 
         # Get image names for project
@@ -287,11 +289,8 @@ class DatasetObjDetect(object):
     def get_annotations_by_project(self, project_id: int, skip_tags: List = []) -> pd.DataFrame:
         self.create_datasources()
         image_names = self.unique_image_names([project_id], skip_tags=skip_tags)
-        anno_df = []
-        for image_name in image_names:
-            anno_df.append(self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name") == image_name).to_pandas())
-        if anno_df:
-            anno_df = pd.concat(anno_df)
+        print('Filtering annotations')
+        anno_df = self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name").isin(image_names)).to_pandas()
         return anno_df
 
     @staticmethod
@@ -332,12 +331,13 @@ class DatasetObjDetect(object):
             image_dfs = pd.concat(image_df)
         else:
             self.create_datasources()
+            print('Filtering images')
             image_dfs = self.images.to_table(columns=image_proj, filter=(ds.field("project_id").isin(anno_df['project_id'].unique()))).to_pandas()
         # Remove things labeled 'badimage'
         for image_name in anno_df['image_name'].unique():
             image_name = os.path.splitext(image_name)[0]
             image_df = image_dfs[image_dfs['image_name'] == image_name]
-            img_bytes = image_df['image_bytes']
+            img_bytes = image_df['image_bytes'].values[0] if image_df['image_bytes'].values else None
             tag_list = [tag for taglist in list(image_df['tags']) for tag in taglist]
             if 'badimage' in tag_list:
                 print('Skipping bad image', image_name)
