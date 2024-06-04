@@ -4,7 +4,7 @@ import logging
 import os
 import random
 import re
-from typing import List, Any, Tuple, Dict
+from typing import List, Any, Tuple, Dict, Union
 
 import fsspec
 import gcsfs
@@ -182,8 +182,10 @@ class DatasetObjDetect(object):
 
     def create_datasources(self):
         if self.images is None:
-            self.images = ds.dataset(self.image_path, filesystem=self.pa_fs, schema=self.image_schema, partitioning="hive")
+            print("Loading images from datalake")
+            self.images = ds.dataset(self.image_path, schema=self.image_schema, filesystem=self.pa_fs, partitioning="hive")
         if self.annotations is None:
+            print("Loading annotations from datalake")
             self.annotations = ds.dataset(self.anno_path, schema=self.anno_schema, filesystem=self.pa_fs, partitioning="hive")
 
     def unique_image_names(self, project_ids: List[int], skip_tags: List[str] = [], image_feather: str = None) -> List[str]:
@@ -194,6 +196,7 @@ class DatasetObjDetect(object):
             image_df = pd.concat(image_df)
         else:
             self.create_datasources()
+            print('Filtering unique images')
             image_df = self.images.to_table(columns=["image_name", "tags"], filter=(ds.field("project_id").isin(project_ids))).to_pandas()
         image_df = image_df[image_df['tags'].apply(lambda x: self.filter_skip_tags(skip_tags, x))]
         return image_df['image_name'].unique()
@@ -229,44 +232,65 @@ class DatasetObjDetect(object):
         })
         return df.drop_duplicates()
 
-    def image_sampler(self, project_ids: List[int], skip_tags: List[str] = [], image_feather: str = None, anno_feather: str = None, p: float = 0.2) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    def image_sampler(self, project_ids: List[int], skip_tags: List[str] = [], image_feather: str = None, anno_feather: str = None, test_split: bool = False, p: float = 0.2) -> Union[Tuple[pd.DataFrame, pd.DataFrame], Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]]:
         train_df = []
         validate_df = []
-        image_names = self.unique_image_names(project_ids, skip_tags, image_feather)
-        print('Found', len(image_names), 'unique images')
-        np.random.shuffle(image_names)
-        val_images = image_names[:int(len(image_names)*p)]
-        anno_df = []
+        test_df = []
+
+        # Get annotations from disk or datalake
         if anno_feather is not None:
             anno_df = []
             for project_id in project_ids:
                 anno_df.append(feather.read_feather(anno_feather.format(project_id)))
             anno_dfs = pd.concat(anno_df)
-        for image_name in image_names:
-            if anno_feather is not None:
-                anno_df = anno_dfs[anno_dfs['image_name'] == image_name]
-            else:
-                anno_df = self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name") == image_name).to_pandas()
-            if image_name in val_images:
-                print("Adding", image_name, "to val")
+        else:
+            self.create_datasources()
+            print('Filtering annotations')
+            anno_dfs = self.annotations.to_table(columns=self.anno_proj, filter=(ds.field("project_id").isin(project_ids))).to_pandas()
+
+        # Get image names for project
+        image_names = self.unique_image_names(project_ids, skip_tags, image_feather)
+        image_names = pd.DataFrame({ 'image_name': image_names })
+        print(f"Found {len(image_names)} unique images")
+        
+        # Split into train, validation, and test
+        if test_split:
+            split_images = image_names.sample(frac=p)
+            val_images = split_images.sample(frac=0.8)
+            test_images = split_images.drop(val_images.index)
+        else:
+            val_images = image_names.sample(frac=p)
+            test_images = pd.DataFrame({ 'image_name': [] })
+
+        for image_name in image_names['image_name']:
+            anno_df = anno_dfs[anno_dfs['image_name'] == image_name]
+
+            if image_name in val_images['image_name'].unique():
+                print(f"Adding {image_name} to val")
                 validate_df.append(anno_df)
+            elif test_split and image_name in test_images['image_name'].unique():
+                print(f"Adding {image_name} to test")
+                test_df.append(anno_df)
             else:
-                print("Adding", image_name, "to train")
+                print(f"Adding {image_name} to train")
                 train_df.append(anno_df)
+
+        # Concatenate dataframes and return
         if train_df:
             train_df = pd.concat(train_df)
         if validate_df:
             validate_df = pd.concat(validate_df)
+        if test_split:
+            if test_df:
+                test_df = pd.concat(test_df)
+            return train_df, validate_df, test_df
         return train_df, validate_df
 
     def get_annotations_by_project(self, project_id: int, skip_tags: List = []) -> pd.DataFrame:
         self.create_datasources()
         image_names = self.unique_image_names([project_id], skip_tags=skip_tags)
-        anno_df = []
-        for image_name in image_names:
-            anno_df.append(self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name") == image_name).to_pandas())
-        if anno_df:
-            anno_df = pd.concat(anno_df)
+        print('Filtering annotations')
+        anno_df = self.annotations.to_table(columns=self.anno_proj, filter=ds.field("image_name").isin(image_names)).to_pandas()
         return anno_df
 
     @staticmethod
@@ -295,6 +319,7 @@ class DatasetObjDetect(object):
         image_names = []
         widths = []
         heights = []
+        image_bytes = []
         tags = []
         if not os.path.exists(output_dir):
             os.makedirs(output_dir)
@@ -306,13 +331,13 @@ class DatasetObjDetect(object):
             image_dfs = pd.concat(image_df)
         else:
             self.create_datasources()
+            print('Filtering images')
+            image_dfs = self.images.to_table(columns=image_proj, filter=(ds.field("project_id").isin(anno_df['project_id'].unique()))).to_pandas()
         # Remove things labeled 'badimage'
         for image_name in anno_df['image_name'].unique():
             image_name = os.path.splitext(image_name)[0]
-            if image_feather is not None:
-                image_df = image_dfs[image_dfs['image_name'] == image_name]
-            else:
-                image_df = self.images.to_table(columns=image_proj, filter=ds.field("image_name") == image_name).to_pandas()
+            image_df = image_dfs[image_dfs['image_name'] == image_name]
+            img_bytes = image_df['image_bytes'].values[0] if image_df['image_bytes'].values else None
             tag_list = [tag for taglist in list(image_df['tags']) for tag in taglist]
             if 'badimage' in tag_list:
                 print('Skipping bad image', image_name)
@@ -321,13 +346,14 @@ class DatasetObjDetect(object):
                 if image_dir is not None and os.path.exists(os.path.join(image_dir, f"{image_name}.jpeg")):
                     img = Image.open(os.path.join(image_dir, f"{image_name}.jpeg"))
                 else:
-                    img = Image.open(io.BytesIO(row.image_bytes))
+                    img = Image.open(io.BytesIO(img_bytes))
                 # This will redact excluded regions
                 img = self.preprocess_image_with_labels(img, anno_df, row)
                 img.save(os.path.join(output_dir, f"{image_name}.jpeg"))
                 image_names.append(image_name)
                 widths.append(img.width)
                 heights.append(img.height)
+                image_bytes.append(img_bytes)
                 tags.append(tag_list)
             if count % 10:
                 print(".", end="")
@@ -337,6 +363,7 @@ class DatasetObjDetect(object):
             'image_name': image_names,
             'width': widths,
             'height': heights,
+            'image_bytes': image_bytes,
             'tags': tags
         })
 
